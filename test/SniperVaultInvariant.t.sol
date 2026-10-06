@@ -15,6 +15,7 @@ contract VaultSequenceHandler is Test {
         uint256 donated;
         uint256 proceeds;
         uint256 rewards;
+        uint256 pendingEth;
         uint256 lastCost;
         uint8 lastLevel;
         bytes32 policy;
@@ -34,6 +35,9 @@ contract VaultSequenceHandler is Test {
     mapping(address => uint256) public cashOut;
     uint256 public successfulSales;
     uint256 public ownerWithdrawals;
+    uint256 public reservedEth;
+    uint256 public successfulRetries;
+    uint8 public conversionMode;
 
     constructor(SniperVault vault_, address keeper_, address outsider_) {
         vault = vault_;
@@ -82,7 +86,7 @@ contract VaultSequenceHandler is Test {
         // One minor unit of either funding asset buys one minor unit of this launch.
         venue.setRate(pool, asset, address(token), 1, 1);
         uint256 beforeBalance = _balance(asset);
-        uint256 budget = beforeBalance * vault.maxSpendBps() / 10_000;
+        uint256 budget = _available(asset) * vault.maxSpendBps() / 10_000;
         bytes4 reason;
         if (vault.keeper() != keeper) {
             reason = SniperVault.Unauthorized.selector;
@@ -120,6 +124,7 @@ contract VaultSequenceHandler is Test {
                 donated: 0,
                 proceeds: 0,
                 rewards: 0,
+                pendingEth: 0,
                 lastCost: spent,
                 lastLevel: 0,
                 policy: keccak256(abi.encode(p.multiples, p.sellBps)),
@@ -135,7 +140,6 @@ contract VaultSequenceHandler is Test {
         SniperVault.Position memory p = vault.positionOf(address(h.token));
         price = bound(price, 1, 150);
         venue.setRate(p.poolId, address(h.token), p.asset, price, 1);
-        venue.setRate(vault.imdEthPoolId(), address(0), address(imd), 1000, 1);
         address caller = emergency || ownerCaller ? owner : keeper;
         bytes4 reason;
         if (caller == keeper && vault.keeper() != keeper) {
@@ -164,20 +168,78 @@ contract VaultSequenceHandler is Test {
         assertGt(amount, 0, "successful sale moves tokens");
         // At the fixture's 1:1 entry price every sold unit has one unit of cost basis.
         uint256 profitShare = amount * (price - 1) * vault.stakerShareBps() / 10_000;
-        assertEq(reward, p.asset == address(0) ? profitShare * 1000 : profitShare, "profit-only reward share");
+        bool deferred = p.asset == address(0) && conversionMode != 0;
+        uint256 expectedReward = deferred ? 0 : p.asset == address(0) ? profitShare * 1000 : profitShare;
+        assertEq(reward, expectedReward, "profit-only reward share");
         h.sold += amount;
         h.proceeds += amount * price;
         h.rewards += reward;
         cashIn[p.asset] += amount * price;
-        cashOut[p.asset] += profitShare;
+        if (deferred) {
+            h.pendingEth += profitShare;
+            reservedEth += profitShare;
+        } else {
+            cashOut[p.asset] += profitShare;
+        }
         ++successfulSales;
         _checkpoint(index);
+    }
+
+    function setRewardQuote(uint256 mode) public {
+        conversionMode = uint8(mode % 3);
+        // A very small positive rate produces sub-unit output throughout this bounded campaign.
+        venue.setRate(
+            vault.imdEthPoolId(),
+            address(0),
+            address(imd),
+            conversionMode == 2 ? 1 : 1000,
+            conversionMode == 2 ? type(uint128).max : 1
+        );
+        if (conversionMode == 1) venue.setTimestamp(vault.imdEthPoolId(), address(0), address(imd), 0);
+    }
+
+    function fundPending(uint256 seed, uint256 failure) public {
+        if (holdings.length == 0) return;
+        Holding storage h = holdings[seed % holdings.length];
+        uint256 amount = h.pendingEth;
+        failure %= 3;
+        if (amount == 0 || conversionMode != 0) {
+            vm.prank(outsider);
+            vm.expectRevert(amount == 0 ? Trading.ZeroAmount.selector : Trading.InvalidQuote.selector);
+            vault.fundPendingRewards(address(h.token));
+        } else if (failure != 0) {
+            if (failure == 1) venue.configure(10_000, false, vault.imdEthPoolId());
+            else imd.setBlockedRecipient(address(staking));
+            vm.prank(outsider);
+            vm.expectRevert(failure == 1 ? bytes("swap failed") : bytes("recipient blocked"));
+            vault.fundPendingRewards(address(h.token));
+            venue.configure(10_000, false, bytes32(0));
+            imd.setBlockedRecipient(address(0));
+        } else {
+            vm.prank(outsider);
+            assertEq(vault.fundPendingRewards(address(h.token)), amount * 1000, "reserved conversion output");
+            h.pendingEth = 0;
+            reservedEth -= amount;
+            h.rewards += amount * 1000;
+            cashOut[address(0)] += amount;
+            ++successfulRetries;
+        }
+        // Failed conversion/funding must preserve the position, reserve, balances and approvals.
+        assertAccounting();
+    }
+
+    function withdrawReserved() public {
+        if (reservedEth == 0) return;
+        uint256 amount = _available(address(0)) + 1;
+        vm.prank(owner);
+        vm.expectRevert(SniperVault.ReservedRewards.selector);
+        vault.withdraw(address(0), amount);
     }
 
     function withdraw(uint256 seed, uint256 amount) public {
         uint256 choice = seed % (holdings.length + 2);
         address asset = choice == 0 ? address(0) : choice == 1 ? address(imd) : address(holdings[choice - 2].token);
-        uint256 available = _balance(asset);
+        uint256 available = _available(asset);
         if (available == 0) return;
         amount = bound(amount, 1, available);
         if (choice >= 2) _recordWithdrawal(choice - 2, amount);
@@ -189,7 +251,7 @@ contract VaultSequenceHandler is Test {
     }
 
     function withdrawAll() public {
-        cashOut[address(0)] += address(vault).balance;
+        cashOut[address(0)] += _available(address(0));
         cashOut[address(imd)] += imd.balanceOf(address(vault));
         for (uint256 i; i < holdings.length; ++i) {
             _recordWithdrawal(i, holdings[i].token.balanceOf(address(vault)));
@@ -256,11 +318,16 @@ contract VaultSequenceHandler is Test {
         return asset == address(0) ? address(vault).balance : MockERC20(asset).balanceOf(address(vault));
     }
 
+    function _available(address asset) private view returns (uint256) {
+        return _balance(asset) - (asset == address(0) ? reservedEth : 0);
+    }
+
     function assertAccounting() public view {
         assertEq(address(vault).balance + cashOut[address(0)], cashIn[address(0)], "ETH flow conservation");
         assertEq(imd.balanceOf(address(vault)) + cashOut[address(imd)], cashIn[address(imd)], "IMD flow conservation");
         assertEq(vault.snipedTokenCount(), holdings.length);
         uint256 rewards;
+        uint256 pending;
         for (uint256 i; i < holdings.length; ++i) {
             Holding storage h = holdings[i];
             SniperVault.Position memory p = vault.positionOf(address(h.token));
@@ -273,6 +340,7 @@ contract VaultSequenceHandler is Test {
             assertEq(p.remainingCost, p.remainingAmount, "one-to-one entry cost conservation");
             assertEq(p.proceeds, h.proceeds);
             assertEq(p.rewardsImd, h.rewards);
+            assertEq(vault.pendingRewardsEth(address(h.token)), h.pendingEth, "position reward reserve");
             assertEq(keccak256(abi.encode(p.multiples, p.sellBps)), h.policy, "purchase policy remains fixed");
             assertLe(p.nextLevel, 5);
             if (h.closed) assertEq(p.remainingAmount, 0, "closed position reopened");
@@ -280,7 +348,12 @@ contract VaultSequenceHandler is Test {
             assertEq(h.token.balanceOf(keeper), 0);
             assertEq(h.token.balanceOf(outsider), 0);
             rewards += h.rewards;
+            pending += h.pendingEth;
         }
+        assertEq(pending, reservedEth, "sum of position reserves");
+        assertEq(vault.totalPendingRewardsEth(), reservedEth, "reserved profit remains owed to staking");
+        assertGe(address(vault).balance, reservedEth, "ETH backs deferred rewards");
+        assertEq(vault.availableBalance(address(0)), _available(address(0)), "reserve excluded from spendable ETH");
         assertEq(staking.totalRewardsFunded(), rewards, "all sale rewards reach staking");
         assertEq(staking.rewardLiability(), rewards);
         assertEq(imd.balanceOf(address(staking)), rewards);
@@ -303,7 +376,7 @@ contract SniperVaultInvariantTest is BaseTest {
         handler = new VaultSequenceHandler(vault, KEEPER, EVE);
         handler.snipe(1_000_000 ether, false);
         handler.snipe(1_000_000 ether, true);
-        bytes4[] memory selectors = new bytes4[](9);
+        bytes4[] memory selectors = new bytes4[](12);
         selectors[0] = handler.deposit.selector;
         selectors[1] = handler.configure.selector;
         selectors[2] = handler.snipe.selector;
@@ -313,6 +386,9 @@ contract SniperVaultInvariantTest is BaseTest {
         selectors[6] = handler.donatePosition.selector;
         selectors[7] = handler.retryPurchase.selector;
         selectors[8] = handler.unauthorized.selector;
+        selectors[9] = handler.setRewardQuote.selector;
+        selectors[10] = handler.fundPending.selector;
+        selectors[11] = handler.withdrawReserved.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -328,6 +404,12 @@ contract SniperVaultInvariantTest is BaseTest {
         vm.prank(OWNER);
         vault.pause();
         handler.withdrawAll();
+        handler.assertAccounting();
+        assertEq(address(vault).balance, handler.reservedEth());
+        handler.setRewardQuote(0);
+        for (uint256 i; i < vault.snipedTokenCount(); ++i) {
+            handler.fundPending(i, 0);
+        }
         handler.assertAccounting();
         assertEq(address(vault).balance, 0);
         assertEq(imd.balanceOf(address(vault)), 0);
@@ -346,5 +428,30 @@ contract SniperVaultInvariantTest is BaseTest {
         handler.assertAccounting();
         assertEq(handler.successfulSales(), 3);
         assertGt(handler.ownerWithdrawals(), 0);
+    }
+
+    function test_handlerPreservesReservesAcrossFailuresWithdrawalsAndClosedPositions() public {
+        handler.setRewardQuote(1);
+        handler.sell(1, 5, false, false);
+        assertGt(handler.reservedEth(), 0);
+        handler.fundPending(1, 0); // Stale quote.
+        handler.setRewardQuote(2);
+        handler.sell(1, 10, false, true); // Add dust to the same reserve.
+        handler.fundPending(1, 0); // Zero-output quote.
+        handler.withdrawReserved();
+        handler.setRewardQuote(0);
+        handler.fundPending(1, 1); // Swap reverts.
+        handler.fundPending(1, 2); // Staking funding reverts after the swap.
+        handler.configure(10_000, 0, 0, false, false);
+        handler.snipe(1e26, true); // Spend all available ETH, leaving the reserve intact.
+        assertEq(address(vault).balance, handler.reservedEth());
+        handler.configure(100, 1000, 0, true, true);
+        handler.withdrawAll();
+        handler.assertAccounting();
+        handler.fundPending(1, 0); // Permissionless retry works after the position is closed.
+        handler.fundPending(1, 0); // Already settled.
+        assertEq(handler.successfulRetries(), 1);
+        assertEq(handler.reservedEth(), 0);
+        assertEq(address(vault).balance, 0);
     }
 }

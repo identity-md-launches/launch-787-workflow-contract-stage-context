@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {BaseTest, CompanyStaking, LaunchToken, MockERC20, MockVenue, Math} from "./Base.t.sol";
+import {BaseTest, CompanyStaking, LaunchToken, MockERC20, MockVenue, Math, Trading} from "./Base.t.sol";
 import {Test} from "forge-std/Test.sol";
 
 /// @dev The oracle integrates each time interval into calendar days. It does not use
@@ -26,6 +26,8 @@ contract StakingSequenceHandler is Test {
     uint256 public totalFunded;
     uint256 public totalPaid;
     uint256 public burnedImd;
+    uint256 public burnedCompany;
+    uint256 public retiredDust;
     uint256 public donatedCompany;
     uint256 public donatedImd;
 
@@ -120,6 +122,14 @@ contract StakingSequenceHandler is Test {
     }
 
     function burn(uint256 seed) public {
+        _burn(seed, false, false);
+    }
+
+    function burnFractional(uint256 seed, bool stale) public {
+        _burn(seed, true, stale);
+    }
+
+    function _burn(uint256 seed, bool fractional, bool stale) private {
         if (fundedDays.length == 0) return;
         uint256 day = fundedDays[seed % fundedDays.length];
         if (didBurn[day]) {
@@ -129,12 +139,23 @@ contract StakingSequenceHandler is Test {
             vm.expectRevert(CompanyStaking.BatchNotExpired.selector);
             staking.burnExpired(day);
         } else {
-            venue.setRate(pool, address(imd), address(company), 2, 1);
+            venue.setRate(pool, address(imd), address(company), fractional ? 1 : 2, fractional ? 10 : 1);
             uint256 amount = funded[day] - paid[day];
+            if (stale && amount != 0) {
+                venue.setTimestamp(pool, address(imd), address(company), 0);
+                vm.prank(actors[seed % 3]);
+                vm.expectRevert(Trading.InvalidQuote.selector);
+                staking.burnExpired(day);
+                assertAccounting();
+                return;
+            }
+            uint256 expected = fractional ? amount / 10 : amount * 2;
             vm.prank(actors[seed % 3]);
-            assertEq(staking.burnExpired(day), amount * 2, "burn output");
+            assertEq(staking.burnExpired(day), expected, "burn output");
             didBurn[day] = true;
-            burnedImd += amount;
+            if (expected == 0) retiredDust += amount;
+            else burnedImd += amount;
+            burnedCompany += expected;
         }
     }
 
@@ -189,14 +210,15 @@ contract StakingSequenceHandler is Test {
         }
         assertEq(staking.totalStaked(), sum, "sum of stakes");
         assertEq(company.balanceOf(address(staking)), sum + donatedCompany, "principal and donation backing");
-        uint256 liability = totalFunded - totalPaid - burnedImd;
-        assertEq(staking.rewardLiability(), liability, "funded = paid + burned + owed");
-        assertEq(imd.balanceOf(address(staking)), liability + donatedImd, "reward backing");
+        uint256 liability = totalFunded - totalPaid - burnedImd - retiredDust;
+        assertEq(staking.rewardLiability(), liability, "funded = paid + burned + dust + owed");
+        assertEq(imd.balanceOf(address(staking)), liability + donatedImd + retiredDust, "reward and dust backing");
         assertEq(staking.totalRewardsFunded(), totalFunded);
         assertEq(staking.totalRewardsPaid(), totalPaid);
         assertEq(staking.totalImdBurned(), burnedImd);
-        assertEq(company.balanceOf(staking.DEAD()), burnedImd * 2);
-        assertEq(staking.totalCompanyBurned(), burnedImd * 2);
+        assertEq(staking.totalImdDust(), retiredDust);
+        assertEq(company.balanceOf(staking.DEAD()), burnedCompany);
+        assertEq(staking.totalCompanyBurned(), burnedCompany);
         assertEq(imd.allowance(address(staking), address(venue)), 0, "no residual router approval");
 
         uint256 today = block.timestamp / 1 days;
@@ -253,7 +275,7 @@ contract CompanyStakingInvariantTest is BaseTest {
         imd.mint(address(handler), 1_000_000 ether);
         handler.stake(0, 10 ether);
         handler.fund(100 ether);
-        bytes4[] memory selectors = new bytes4[](9);
+        bytes4[] memory selectors = new bytes4[](10);
         selectors[0] = handler.stake.selector;
         selectors[1] = handler.unstake.selector;
         selectors[2] = handler.fund.selector;
@@ -263,6 +285,7 @@ contract CompanyStakingInvariantTest is BaseTest {
         selectors[6] = handler.burn.selector;
         selectors[7] = handler.donate.selector;
         selectors[8] = handler.roundTrip.selector;
+        selectors[9] = handler.burnFractional.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -292,5 +315,30 @@ contract CompanyStakingInvariantTest is BaseTest {
         handler.exitAndSettle();
         assertGt(handler.totalPaid(), 0);
         assertGt(handler.burnedImd(), 0);
+    }
+
+    function test_handlerRetainsDustWithoutSpendingOtherBatchesOrDonations() public {
+        handler.elapse(1 days);
+        handler.claimAll(0); // Settle the initial large batch.
+        handler.unstake(0, 10 ether);
+        handler.fund(9); // Below one COMPANY minor unit at the fractional quote.
+        handler.donate(11, true);
+        handler.donate(7, false);
+        handler.elapse(3 days);
+        handler.elapse(3 days);
+        handler.elapse(2 days);
+        handler.fund(100); // New, unexpired liability alongside expired dust.
+        handler.burnFractional(1, true); // Stale zero-output quote must keep the liability.
+        assertEq(handler.retiredDust(), 0);
+        assertEq(staking.rewardLiability(), 109);
+        handler.burnFractional(1, false);
+        assertEq(handler.retiredDust(), 9);
+        assertEq(staking.rewardLiability(), 100);
+        handler.burn(1); // Retired batch cannot reopen even at a better price.
+        handler.exitAndSettle();
+        assertEq(imd.balanceOf(address(staking)), 20); // Donation plus permanently retained dust.
+        assertEq(company.balanceOf(address(staking)), 7);
+        assertEq(handler.burnedImd(), 100);
+        assertEq(handler.burnedCompany(), 200);
     }
 }
