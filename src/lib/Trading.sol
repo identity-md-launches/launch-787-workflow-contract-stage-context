@@ -70,14 +70,25 @@ abstract contract Trading is ReentrancyGuard {
         view
         returns (uint256 quoted)
     {
+        quoted = _quoteIncludingZero(pool, tokenIn, tokenOut, amount, exactOutput);
+        if (quoted == 0) revert InvalidQuote();
+    }
+
+    /// @dev Only dust accounting may accept zero output; freshness is still mandatory.
+    function _quoteIncludingZero(bytes32 pool, address tokenIn, address tokenOut, uint256 amount, bool exactOutput)
+        internal
+        view
+        returns (uint256 quoted)
+    {
         if (block.chainid != expectedChainId) revert WrongChain();
         uint256 updatedAt;
         if (exactOutput) (quoted, updatedAt) = venue.quoteExactOutput(pool, tokenIn, tokenOut, amount);
         else (quoted, updatedAt) = venue.quoteExactInput(pool, tokenIn, tokenOut, amount);
-        if (quoted == 0 || updatedAt == 0 || updatedAt > block.timestamp || block.timestamp - updatedAt > MAX_QUOTE_AGE)
-        {
-            revert InvalidQuote();
-        }
+        if (!_freshQuote(updatedAt)) revert InvalidQuote();
+    }
+
+    function _freshQuote(uint256 updatedAt) internal view returns (bool) {
+        return updatedAt != 0 && updatedAt <= block.timestamp && block.timestamp - updatedAt <= MAX_QUOTE_AGE;
     }
 
     function _minimum(uint256 quoted, uint256 slippage) internal pure returns (uint256) {

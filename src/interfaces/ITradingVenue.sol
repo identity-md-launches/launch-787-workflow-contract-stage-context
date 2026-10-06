@@ -4,6 +4,8 @@ pragma solidity 0.8.26;
 /// @notice Required immutable swap/oracle adapter interface. Native ETH is address(0).
 /// @dev Quotes MUST come from a manipulation-resistant, independently reviewed price source,
 /// including fees/price impact, with the actual observation timestamp (not the query time).
+/// A fresh zero-output quote means sub-unit rounding. Missing/unusable pricing MUST revert
+/// or carry an invalid timestamp, since staking may retire a fresh zero-output batch as dust.
 /// No caller-selected routes, callbacks, approvals, arbitrary calldata or recipients are exposed
 /// by the application contracts. The adapter must validate poolId against both currencies.
 interface ITradingVenue {

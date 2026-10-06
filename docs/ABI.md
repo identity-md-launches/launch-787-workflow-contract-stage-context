@@ -12,8 +12,8 @@ Standard ERC-20 functions: `name`, `symbol`, `decimals`, `totalSupply`, `balance
 | --- | --- | --- |
 | OWNER | `depositIMD(uint256)` | Pull IMD after approval; rejects zero/transfer fees |
 | OWNER | `depositETH()` | Payable deposit; rejects zero |
-| OWNER | `withdraw(address,uint256)` | Transfer specified asset to immutable owner; zero address means ETH |
-| OWNER | `withdrawAll()` | Transfer ETH, IMD, and all known bought-token balances to owner |
+| OWNER | `withdraw(address,uint256)` | Transfer specified available asset to immutable owner; zero address means ETH; reserved reward ETH cannot be withdrawn |
+| OWNER | `withdrawAll()` | Transfer available ETH, IMD, and all known bought-token balances to owner; retain reserved reward ETH |
 | OWNER | `pause()`, `unpause()` | Change new-buy permission only |
 | OWNER | `setKeeper(address)` | Replace keeper; zero disables it |
 | OWNER | `setMaxSpendBps(uint256)` | 1–10000, default 100 |
@@ -23,6 +23,7 @@ Standard ERC-20 functions: `name`, `symbol`, `decimals`, `totalSupply`, `balance
 | OWNER | `emergencySell(address)` | Liquidate remaining tracked position at bounded quoted price; distribute positive profit |
 | KEEPER | `snipe(address)` | One constrained purchase of an authenticated launch |
 | KEEPER or OWNER | `sell(address)` | Execute next eligible nonzero tranche |
+| Anyone | `fundPendingRewards(address)` | Convert that position's reserved ETH to IMD and fund today's staking batch; failed attempts preserve the reserve |
 
 `positionOf(token)` returns a tuple:
 
@@ -37,9 +38,9 @@ Standard ERC-20 functions: `name`, `symbol`, `decimals`, `totalSupply`, `balance
 | `nextLevel` | Next unexecuted ladder index 0–4, or 5 after final/emergency exit |
 | `multiples`, `sellBps` | Snapshot of the five ladder levels and original-position fractions |
 
-An unbought token has `originalAmount == 0`; a closed/withdrawn position has `remainingAmount == 0`. Owner withdrawal can close inventory without advancing `nextLevel`, so UI status must check inventory first. `snipedTokenCount()` and `snipedTokens(index)` enumerate historic buys. There is intentionally no user-supplied recipient or arbitrary swap calldata.
+An unbought token has `originalAmount == 0`; a closed/withdrawn position has `remainingAmount == 0`. Owner withdrawal can close inventory without advancing `nextLevel`, so UI status must check inventory first. `snipedTokenCount()` and `snipedTokens(index)` enumerate historic buys. There is intentionally no user-supplied recipient or arbitrary swap calldata. `pendingRewardsEth(token)` and `totalPendingRewardsEth()` report reserved ETH in wei; `availableBalance(asset)` subtracts the total reserve from ETH only. This reserve is a liability payable in IMD after conversion; it is not yet part of staking's `rewardLiability`. A pending reserve remains fundable even after a full sale or owner withdrawal closes the position.
 
-`Sniped` records token, original asset, amount, cost and entry-price ratio. `Sold` records original asset, index, sold amount, proceeds, allocated cost, nonnegative profit, IMD rewards and emergency flag (level 5 for emergency). `Deposited`, `Withdrawn`, `KeeperChanged`, `PauseChanged`, `MaxSpendChanged`, `SlippageChanged`, `StakerShareChanged` and `LadderChanged` support treasury/admin history.
+`Sniped` records token, original asset, amount, cost and entry-price ratio. `Sold` records original asset, index, sold amount, proceeds, allocated cost, nonnegative profit, IMD rewards and emergency flag (level 5 for emergency). `RewardsDeferred(token,addedEth,pendingEth)` records a sale's deferred share; `Sold.rewardsImd` is zero for that deferred share. `DeferredRewardsFunded(token,ethSpent,rewardsImd)` records the later funding, which also updates the position's cumulative reward amount. `Deposited`, `Withdrawn`, `KeeperChanged`, `PauseChanged`, `MaxSpendChanged`, `SlippageChanged`, `StakerShareChanged` and `LadderChanged` support treasury/admin history.
 
 Build P&L and win-rate metrics from confirmed events, including cost retired by withdrawals; do not count owner withdrawals as trading losses or deposits as profits. Keep ETH and IMD amounts separate until independently priced in a common currency. Current vault value and USD conversions need off-chain pricing; the contracts do not promise a USD valuation or a particular win-rate definition.
 
@@ -52,19 +53,19 @@ Build P&L and win-rate metrics from confirmed events, including cost retired by 
 | `notifyReward(uint256)` | Pull caller's IMD into current UTC-day batch after approval |
 | `claimAll()` | Transfer caller's share from up to seven completed unexpired days; returns IMD amount (possibly zero) |
 | `claim(uint256 batchId)` | Claim a specific completed, unexpired, not-previously-claimed batch |
-| `burnExpired(uint256 batchId)` | Anyone can exchange only that expired batch's remaining reward into dead-address COMPANY |
+| `burnExpired(uint256 batchId)` | Exchange that expired batch's remaining reward into dead-address COMPANY, or retire a fresh zero-output dust quote without swapping |
 | `batchWindow(uint256)` | Return daily close and exclusive expiry timestamps |
 | `stakeSeconds(address,uint256)` | Return user and aggregate stake-seconds for a completed day; zero for current/future/predeployment days |
 | `claimable(address,uint256)` | Current IMD claim amount; zero outside eligibility or after claim |
 | `batches(uint256)` | Return `funded`, `claimed`, `burned`; remaining equals funded minus claimed until burned |
 | `claimed(uint256,address)` | Whether this account processed that batch; zero-value claims may mark it too |
 
-Additional getters: `company`, `imd`, `balanceOf(account)`, `totalStaked`, `firstBatch`, `rewardLiability`, `totalRewardsFunded`, `totalRewardsPaid`, `totalImdBurned`, `totalCompanyBurned`, `DEAD`, and shared immutable integration getters. `totalImdBurned` is IMD spent buying COMPANY, not IMD sent to a burn address. The accounting identity is `totalRewardsFunded = totalRewardsPaid + totalImdBurned + rewardLiability`.
+Additional getters: `company`, `imd`, `balanceOf(account)`, `totalStaked`, `firstBatch`, `rewardLiability`, `totalRewardsFunded`, `totalRewardsPaid`, `totalImdBurned`, `totalCompanyBurned`, `totalImdDust`, `DEAD`, and shared immutable integration getters. `totalImdBurned` is IMD spent buying COMPANY, not IMD sent to a burn address. The accounting identity is `totalRewardsFunded = totalRewardsPaid + totalImdBurned + totalImdDust + rewardLiability`. `totalImdDust` is retired unswappable IMD retained permanently by staking. It is excluded from paid rewards and burn volume, and cannot be swept or spent by later batch burns.
 
-Index `Staked`, `Unstaked`, `RewardsFunded(batchId,funder,amount)`, `RewardClaimed(batchId,account,amount)` and `ExpiredBurned(batchId,imdSpent,companySentToDead)`. Identify batches by UTC day number, not event sequence number. Multiple funding events share one batch. There is no global unbounded on-chain batch enumeration: enumerate funded IDs from events, and filter by `batchWindow`/`batches`.
+Index `Staked`, `Unstaked`, `RewardsFunded(batchId,funder,amount)`, `RewardClaimed(batchId,account,amount)` and `ExpiredBurned(batchId,imdSpent,companySentToDead)`. A dust closure emits `ExpiredDustRetired(batchId,imdRetained)` and `ExpiredBurned(batchId,0,0)`; show it as closed with retained dust, not a pending buyback or a COMPANY burn. Identify batches by UTC day number, not event sequence number. Multiple funding events share one batch. There is no global unbounded on-chain batch enumeration: enumerate funded IDs from events, and filter by `batchWindow`/`batches`.
 
 Countdowns should show that a current batch is still accumulating, then seven days from its daily close. Claims are unavailable at the expiry timestamp. A claim transaction submitted before expiry can still execute after it; use a margin in the UI. Matured claims require no price/router call; burns do.
 
 ## Errors and amounts
 
-Use ABI custom errors to distinguish authorization, paused buys, duplicate buys, target-not-reached, invalid origin, stale/invalid quotes, transfer accounting failures and batch windows. Router/token errors may also bubble. A failed sale/burn is fully retryable; it does not advance the ladder or consume a batch. Token amounts are always raw minor units. Format each asset with its own verified decimals. Avoid JavaScript floating-point numbers for integer amounts, timestamps, prices and basis points.
+Use ABI custom errors to distinguish authorization, paused buys, duplicate buys, target-not-reached, invalid origin, stale/invalid quotes, transfer accounting failures and batch windows. Router/token errors may also bubble. `ReservedRewards` prevents owner withdrawal of booked reward ETH; `ZeroAmount` on `fundPendingRewards` means that token has no pending reserve. An unavailable reward-conversion quote produces a successful sale plus `RewardsDeferred`, not a failed sale. A failed sale/burn is fully retryable; it does not advance the ladder or consume a batch. Token amounts are always raw minor units. Format each asset with its own verified decimals. Avoid JavaScript floating-point numbers for integer amounts, timestamps, prices and basis points.

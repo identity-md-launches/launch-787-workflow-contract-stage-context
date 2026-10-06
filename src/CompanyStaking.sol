@@ -26,6 +26,7 @@ contract CompanyStaking is Trading {
     uint256 public totalRewardsPaid;
     uint256 public totalImdBurned;
     uint256 public totalCompanyBurned;
+    uint256 public totalImdDust;
 
     struct Batch {
         uint256 funded;
@@ -52,6 +53,7 @@ contract CompanyStaking is Trading {
     event RewardsFunded(uint256 indexed batchId, address indexed funder, uint256 amount);
     event RewardClaimed(uint256 indexed batchId, address indexed account, uint256 amount);
     event ExpiredBurned(uint256 indexed batchId, uint256 imdSpent, uint256 companySentToDead);
+    event ExpiredDustRetired(uint256 indexed batchId, uint256 imdRetained);
 
     constructor(
         address company_,
@@ -160,7 +162,8 @@ contract CompanyStaking is Trading {
         if (amount != 0) emit RewardClaimed(batchId, account, amount);
     }
 
-    /// @notice Spend only this expired batch's unclaimed IMD; no caller-selected route or beneficiary.
+    /// @notice Buy and burn with this expired batch's unclaimed IMD, or close unquotable sub-unit dust.
+    /// @dev Dust requires a fresh zero-output quote; retained IMD has no rescue or later spending path.
     function burnExpired(uint256 batchId) external nonReentrant returns (uint256 burnedCompany) {
         Batch storage batch = batches[batchId];
         if (batch.funded == 0) revert UnknownBatch();
@@ -170,15 +173,36 @@ contract CompanyStaking is Trading {
         uint256 amount = batch.funded - batch.claimed;
         batch.burned = true;
         rewardLiability -= amount;
-        totalImdBurned += amount;
         if (amount != 0) {
             (address pairedAsset, bytes32 pool) = _launch(company);
-            uint256 companyBefore = IERC20(company).balanceOf(address(this));
+            uint256 quotedEth;
+            uint256 quotedCompany;
             if (pairedAsset == imd) {
-                burnedCompany = _quotedSwap(pool, imd, company, amount, BURN_SLIPPAGE_BPS);
+                quotedCompany = _quoteIncludingZero(pool, imd, company, amount, false);
             } else {
-                uint256 ethAmount = _quotedSwap(imdEthPoolId, imd, address(0), amount, BURN_SLIPPAGE_BPS);
-                burnedCompany = _quotedSwap(pool, address(0), company, ethAmount, BURN_SLIPPAGE_BPS);
+                quotedEth = _quoteIncludingZero(imdEthPoolId, imd, address(0), amount, false);
+                if (quotedEth != 0) {
+                    quotedCompany = _quoteIncludingZero(pool, address(0), company, quotedEth, false);
+                }
+            }
+            if (quotedCompany == 0) {
+                // Explicit dust retirement: retain unswappable IMD, with no rescue or claim path.
+                // Never treat a stale/missing observation or failed swap as dust.
+                totalImdDust += amount;
+                emit ExpiredDustRetired(batchId, amount);
+                emit ExpiredBurned(batchId, 0, 0);
+                return 0;
+            }
+            totalImdBurned += amount;
+            uint256 companyBefore = IERC20(company).balanceOf(address(this));
+            uint256 minimumCompany = _minimum(quotedCompany, BURN_SLIPPAGE_BPS);
+            if (pairedAsset == imd) {
+                burnedCompany = _swapInput(pool, imd, company, amount, minimumCompany);
+            } else {
+                uint256 ethAmount =
+                    _swapInput(imdEthPoolId, imd, address(0), amount, _minimum(quotedEth, BURN_SLIPPAGE_BPS));
+                // The final bound uses the pre-swap full-route quote, not degraded first-hop output.
+                burnedCompany = _swapInput(pool, address(0), company, ethAmount, minimumCompany);
             }
             IERC20(company).safeTransfer(DEAD, burnedCompany);
             // Principal and unsolicited COMPANY donations stay exactly where they were.
