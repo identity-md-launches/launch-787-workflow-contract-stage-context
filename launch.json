@@ -1,0 +1,37 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Zero Person Billion Dollar Company",
+    "symbol": "COMPANY",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "CompanyStaking",
+      "constructorArgs": [
+        "$token",
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0"
+      ]
+    },
+    {
+      "contract": "SniperVault",
+      "constructorArgs": [
+        "$owner",
+        "$contract:CompanyStaking"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "BLOCKING CONSTRUCTOR FINDING: This manifest is a draft and cannot deploy. CompanyStaking constructorArgs indices 1 through 6 are explicit zero placeholders for, respectively, the Robinhood IMD token address, ILaunchRegistry implementation address, canonical launch factory address, ITradingVenue implementation address, IMD/native ETH conversion pool ID (bytes32), and target chain ID (uint256). The accepted deployment handoff supplies none of these values. Trading's constructor rejects these zeros with InvalidConfiguration; the protected project deployment check must fail until all six approved values are supplied, independently reviewed, and written into this manifest. Notes do not resolve arguments or authorize substitutions. Test fixture addresses and mocks are not production dependencies. The registry and venue must implement the accepted interfaces; immutable dependency identity, behavior and the matching chain ID remain concrete review requirements. LaunchToken has no constructor arguments. CompanyStaking is deployed first with the launch token as company_; SniperVault then receives its policy owner via $owner and the earlier staking address, from which it reads the shared immutable integration settings. CompanyStaking has no owner; the vault owner can withdraw vault assets but cannot withdraw staking principal or rewards. No initialization calls are required. The launch pool pairs with native ETH. The factory supplies the LP, MerkleDistributor and initialization-only PoolInitializationGuard. Supply distribution, policy ownership resolution, source publication, signed artifact linkage, admission, deployment and frontend startup belong to services; this draft does not claim those steps or independent review have occurred."
+}
