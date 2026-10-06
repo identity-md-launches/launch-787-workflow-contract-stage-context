@@ -39,6 +39,8 @@ contract SniperVault is Trading {
 
     mapping(address => Position) private positions;
     address[] public snipedTokens;
+    mapping(address => uint256) public pendingRewardsEth;
+    uint256 public totalPendingRewardsEth;
 
     error Unauthorized();
     error VaultPaused();
@@ -47,6 +49,7 @@ contract SniperVault is Trading {
     error TargetNotReached();
     error InvalidParameters();
     error UnsupportedToken();
+    error ReservedRewards();
 
     event Deposited(address indexed asset, uint256 amount);
     event Withdrawn(address indexed asset, uint256 amount);
@@ -56,6 +59,8 @@ contract SniperVault is Trading {
     event SlippageChanged(uint256 bps);
     event StakerShareChanged(uint256 bps);
     event LadderChanged(uint32[5] multiples, uint16[5] sellBps);
+    event RewardsDeferred(address indexed token, uint256 addedEth, uint256 pendingEth);
+    event DeferredRewardsFunded(address indexed token, uint256 ethSpent, uint256 rewardsImd);
     event Sniped(address indexed token, address indexed asset, uint256 amount, uint256 cost, uint256 entryPrice);
     event Sold(
         address indexed token,
@@ -112,10 +117,11 @@ contract SniperVault is Trading {
         _withdraw(asset, amount);
     }
 
-    /// @notice Withdraws both funding assets and every token ever bought, including while paused.
+    /// @notice Withdraws available funding assets and every token ever bought, including while paused.
+    /// Reserved reward ETH remains payable only to staking.
     /// Use withdraw(asset, amount) for bounded work if the token list is too large or one token reverts.
     function withdrawAll() external onlyOwner nonReentrant {
-        uint256 amount = _balance(address(0));
+        uint256 amount = availableBalance(address(0));
         if (amount != 0) _withdraw(address(0), amount);
         amount = _balance(imd);
         if (amount != 0) _withdraw(imd, amount);
@@ -127,6 +133,7 @@ contract SniperVault is Trading {
     }
 
     function _withdraw(address asset, uint256 amount) private {
+        if (asset == address(0) && amount > availableBalance(asset)) revert ReservedRewards();
         Position storage position = positions[asset];
         uint256 retired = Math.min(amount, position.remainingAmount);
         if (retired != 0) _removeCost(position, retired);
@@ -191,13 +198,32 @@ contract SniperVault is Trading {
         return snipedTokens.length;
     }
 
+    /// @notice ETH already owed to staking cannot fund buys or owner withdrawals.
+    function availableBalance(address asset) public view returns (uint256) {
+        uint256 balance = _balance(asset);
+        return asset == address(0) ? balance - totalPendingRewardsEth : balance;
+    }
+
+    /// @notice Anyone may retry a position's reserved ETH conversion; output only funds staking.
+    /// Failed conversion/funding leaves the entire reserve available for another attempt.
+    function fundPendingRewards(address token) external nonReentrant returns (uint256 reward) {
+        uint256 amount = pendingRewardsEth[token];
+        if (amount == 0) revert ZeroAmount();
+        pendingRewardsEth[token] = 0;
+        totalPendingRewardsEth -= amount;
+        reward = _quotedSwap(imdEthPoolId, address(0), imd, amount, slippageBps);
+        _fundReward(reward);
+        positions[token].rewardsImd += reward;
+        emit DeferredRewardsFunded(token, amount, reward);
+    }
+
     function snipe(address token) external nonReentrant {
         if (msg.sender != keeper) revert Unauthorized();
         if (paused) revert VaultPaused();
         Position storage position = positions[token];
         if (position.originalAmount != 0) revert AlreadySniped();
         (address asset, bytes32 pool) = _launch(token);
-        uint256 budget = Math.mulDiv(_balance(asset), maxSpendBps, BPS);
+        uint256 budget = Math.mulDiv(availableBalance(asset), maxSpendBps, BPS);
         if (budget == 0) revert ZeroAmount();
         uint256 cap = Math.mulDiv(IERC20(token).totalSupply(), MAX_SUPPLY_BPS, BPS);
         uint256 amount = Math.min(cap, Math.mulDiv(_quote(pool, asset, token, budget, false), BPS, BPS + slippageBps));
@@ -264,16 +290,42 @@ contract SniperVault is Trading {
         uint256 proceeds = _swapInput(position.poolId, token, position.asset, amount, minimum);
         uint256 profit = proceeds > cost ? proceeds - cost : 0;
         uint256 share = Math.mulDiv(profit, stakerShareBps, BPS);
-        uint256 reward;
-        if (share != 0) {
-            reward = position.asset == imd ? share : _quotedSwap(imdEthPoolId, address(0), imd, share, slippageBps);
-            IERC20(imd).forceApprove(address(staking), reward);
-            staking.notifyReward(reward);
-            IERC20(imd).forceApprove(address(staking), 0);
-        }
+        uint256 reward = _saleReward(token, position.asset, share);
         position.proceeds += proceeds;
         position.rewardsImd += reward;
         emit Sold(token, position.asset, level, amount, proceeds, cost, profit, reward, emergency);
+    }
+
+    function _saleReward(address token, address asset, uint256 share) private returns (uint256 reward) {
+        if (share == 0) return 0;
+        if (asset == imd) {
+            reward = share;
+        } else {
+            // Keep an unquotable share in ETH; its IMD value is established only on conversion.
+            uint256 quoted = _nativeRewardQuote(share);
+            if (quoted == 0) {
+                pendingRewardsEth[token] += share;
+                totalPendingRewardsEth += share;
+                emit RewardsDeferred(token, share, pendingRewardsEth[token]);
+                return 0;
+            }
+            reward = _swapInput(imdEthPoolId, address(0), imd, share, _minimum(quoted, slippageBps));
+        }
+        _fundReward(reward);
+    }
+
+    function _nativeRewardQuote(uint256 amount) private view returns (uint256) {
+        try venue.quoteExactInput(imdEthPoolId, address(0), imd, amount) returns (uint256 quoted, uint256 updatedAt) {
+            return _freshQuote(updatedAt) ? quoted : 0;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _fundReward(uint256 reward) private {
+        IERC20(imd).forceApprove(address(staking), reward);
+        staking.notifyReward(reward);
+        IERC20(imd).forceApprove(address(staking), 0);
     }
 
     function _removeCost(Position storage position, uint256 amount) private returns (uint256 cost) {
